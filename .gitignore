@@ -1,0 +1,5 @@
+# Private iCal URL - anyone with it can read your calendar
+config.json
+state.json
+logs/
+__pycache__/
