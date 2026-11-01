@@ -161,29 +161,36 @@ def parse_events(text: str) -> list[dict]:
     return events
 
 
-def notes_for(description: str) -> str:
-    """Reduce the calendar description to the course it belongs to."""
+def course_of(description: str) -> str | None:
+    """Course section from the description, e.g. "2184301.i (2026/1)"."""
     match = COURSE_PATTERN.search(description)
-    return f"Course {match.group(1)}" if match else description
+    return match.group(1) if match else None
 
 
-def assignments(events: list[dict]) -> list[dict]:
-    """All "Assignment due" events, soonest first, with a clean title.
+def assignments(events: list[dict], courses: dict[str, str] | None = None) -> list[dict]:
+    """All "Assignment due" events, soonest first, titled "[Course] Name".
+
+    The feed only carries course codes, so `courses` maps a code ("2184301")
+    to the name to show; unmapped codes are shown as the code itself.
 
     myCourseVille starts each event one hour before the deadline and ends it
     at the deadline, so DTEND is the real due time.
     """
+    courses = courses or {}
     result = []
     for event in events:
         summary = event.get("summary", "")
         due = event.get("dtend") or event.get("dtstart")
         if not summary.startswith(ASSIGNMENT_PREFIX) or "uid" not in event or due is None:
             continue
+        name = summary[len(ASSIGNMENT_PREFIX):].strip()
+        course = course_of(event.get("description", ""))
+        code = course.split(".")[0] if course else None
         result.append({
             "uid": event["uid"],
-            "title": summary[len(ASSIGNMENT_PREFIX):].strip(),
+            "title": f"[{courses.get(code, code)}] {name}" if code else name,
             "due": due,
-            "notes": notes_for(event.get("description", "")),
+            "notes": f"Course {course}" if course else event.get("description", ""),
         })
     result.sort(key=lambda a: a["due"])
     return result
@@ -274,9 +281,9 @@ def main(argv: list[str]) -> int:
     if not config or not config.get("ical_url"):
         log(f"Missing {CONFIG_PATH}; copy config.example.json there and add your iCal URL.")
         return 1
-    list_name = config.get("list_name", "CourseVille")
+    list_name = config.get("list_name", "TODO")
 
-    feed = assignments(parse_events(fetch_feed(config["ical_url"])))
+    feed = assignments(parse_events(fetch_feed(config["ical_url"])), config.get("courses"))
     state = load_json(STATE_PATH, {"assignments": {}})["assignments"]
     to_add, to_update = plan(feed, state, datetime.now(timezone.utc))
 

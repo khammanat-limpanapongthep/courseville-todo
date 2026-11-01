@@ -71,7 +71,7 @@ class SelectionTests(unittest.TestCase):
     def test_assignments_only_soonest_first_due_at_end_time(self):
         result = assignments(parse_events(FEED))
         self.assertEqual(
-            [a["title"] for a in result], ["Old HW", "HW10", "Report #8 CSS & HTML"]
+            [a["title"] for a in result], ["Old HW", "HW10", "[2182212] Report #8 CSS & HTML"]
         )
         self.assertEqual(result[1]["due"], datetime(2026, 11, 3, 12, 0, tzinfo=BKK))
 
@@ -79,6 +79,18 @@ class SelectionTests(unittest.TestCase):
         result = assignments(parse_events(FEED))
         self.assertEqual(result[2]["notes"], "Course 2182212.i.01 (2025/1)")
         self.assertEqual(result[0]["notes"], "")  # no description in the feed
+
+    def test_title_uses_course_name_when_mapped(self):
+        result = assignments(parse_events(FEED), {"2182212": "Web Programming"})
+        self.assertEqual(result[2]["title"], "[Web Programming] Report #8 CSS & HTML")
+
+    def test_new_course_name_renames_known_reminder(self):
+        state = {a["uid"]: {"reminder_id": "r", "title": a["title"],
+                            "due": a["due"].isoformat(), "notes": a["notes"]}
+                 for a in assignments(parse_events(FEED))}
+        renamed = assignments(parse_events(FEED), {"2182212": "Web Programming"})
+        self.assertEqual([a["title"] for a in plan(renamed, state, NOW)[1]],
+                         ["[Web Programming] Report #8 CSS & HTML"])
 
 
 class PlanTests(unittest.TestCase):
@@ -95,7 +107,7 @@ class PlanTests(unittest.TestCase):
 
     def test_first_run_adds_only_upcoming(self):
         to_add, to_update = plan(self.feed, {}, NOW)
-        self.assertEqual([a["title"] for a in to_add], ["HW10", "Report #8 CSS & HTML"])
+        self.assertEqual([a["title"] for a in to_add], ["HW10", "[2182212] Report #8 CSS & HTML"])
         self.assertEqual(to_update, [])
 
     def test_nothing_to_do_when_in_sync(self):

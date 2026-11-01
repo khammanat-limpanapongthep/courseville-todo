@@ -4,8 +4,9 @@ Copies myCourseVille assignments into Apple Reminders as to-dos, and keeps them
 in step when a deadline moves.
 
 An hourly background job (launchd) downloads the myCourseVille iCal feed and adds
-each future "Assignment due" event to a Reminders list (default `CourseVille`),
-due at the real deadline, with the course code in the notes. Reminders syncs
+each future "Assignment due" event to a Reminders list (default `TODO`) as
+`[Course] Assignment`, due at the real deadline, with the course code in the
+notes. Reminders syncs
 them to iPhone through iCloud.
 
 - Only future assignments are added; meetings and classes are ignored.
@@ -23,7 +24,7 @@ macOS blocks launchd jobs from reading `~/Documents`, so the job runs from
 | File | What |
 |---|---|
 | `sync.py` | copy of the script, refreshed by `./install.sh` |
-| `config.json` | your private iCal URL (never committed) |
+| `config.json` | your private iCal URL (never committed), list name, and `courses`: course code to the name shown in `[...]` |
 | `state.json` | which assignments were added, and as which reminder |
 | `logs/sync.log` | output of every run |
 
@@ -37,5 +38,9 @@ macOS blocks launchd jobs from reading `~/Documents`, so the job runs from
    for Reminders access.
 4. `./install.sh` to run it every hour. Rerun it after editing `sync.py`.
    `./uninstall.sh` removes the job (reminders are kept).
+
+The feed only carries course codes, so names come from `courses` in
+`config.json`. Unmapped codes show as the code, e.g. `[2184301] HW10`; adding
+a name renames existing reminders on the next run.
 
 Tests: `/usr/bin/python3 -m unittest discover tests`.
