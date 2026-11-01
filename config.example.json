@@ -1,6 +1,7 @@
 {
   "ical_url": "https://www.mycourseville.com/?q=courseville/ical/<your-private-id>",
   "list_name": "TODO",
+  "remind_hours_before": 3,
   "courses": {
     "2184301": "Short course name shown as [name] in the to-do title"
   }

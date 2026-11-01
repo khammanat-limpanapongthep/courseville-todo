@@ -37,11 +37,16 @@ ASSIGNMENT_PREFIX = "Assignment due:"
 # The description ends with e.g. "This is an assignment from 2190443.i (2026/1)."
 COURSE_PATTERN = re.compile(r"assignment from (.+?)\.?\s*$", re.IGNORECASE)
 DEFAULT_TIMEZONE = "Asia/Bangkok"
+DEFAULT_REMIND_HOURS_BEFORE = 3
 
 # Arguments are passed through argv rather than spliced into the script, so
 # quotes or backslashes in an assignment title cannot break the AppleScript.
-#   add    <list> <title> <notes> <y> <m> <d> <h> <min>  -> prints reminder id
-#   update <list> <id> <title> <notes> <y> <m> <d> <h> <min> -> prints updated|completed|missing
+#   add    <list> <title> <notes> <alert y m d h min>      -> prints reminder id
+#   update <list> <id> <title> <notes> <alert y m d h min> -> prints updated|completed|missing
+#
+# A reminder has a single time: Reminders keeps "due date" and "remind me
+# date" equal, so the reminder is dated at the alert time and the real
+# deadline lives in the notes.
 REMINDER_SCRIPT = """
 on makeDate(argv, i)
     set d to current date
@@ -61,11 +66,11 @@ on run argv
     tell application "Reminders"
         if not (exists list listName) then make new list with properties {name:listName}
         if mode is "add" then
-            set d to my makeDate(argv, 5)
-            tell list listName to set r to make new reminder with properties {name:(item 3 of argv), body:(item 4 of argv), due date:d}
+            set alert to my makeDate(argv, 5)
+            tell list listName to set r to make new reminder with properties {name:(item 3 of argv), body:(item 4 of argv), due date:alert, remind me date:alert}
             return id of r
         end if
-        set d to my makeDate(argv, 6)
+        set alert to my makeDate(argv, 6)
         try
             set r to first reminder of list listName whose id is (item 3 of argv)
         on error
@@ -74,7 +79,8 @@ on run argv
         if completed of r then return "completed"
         set name of r to (item 4 of argv)
         set body of r to (item 5 of argv)
-        set due date of r to d
+        set due date of r to alert
+        set remind me date of r to alert
         return "updated"
     end tell
 end run
@@ -167,11 +173,17 @@ def course_of(description: str) -> str | None:
     return match.group(1) if match else None
 
 
-def assignments(events: list[dict], courses: dict[str, str] | None = None) -> list[dict]:
+def assignments(
+    events: list[dict],
+    courses: dict[str, str] | None = None,
+    remind_hours_before: float = DEFAULT_REMIND_HOURS_BEFORE,
+) -> list[dict]:
     """All "Assignment due" events, soonest first, titled "[Course] Name".
 
     The feed only carries course codes, so `courses` maps a code ("2184301")
-    to the name to show; unmapped codes are shown as the code itself.
+    to the name to show; unmapped codes are shown as the code itself. The
+    reminder is dated `remind_hours_before` hours before the deadline, and the
+    deadline itself goes in the notes.
 
     myCourseVille starts each event one hour before the deadline and ends it
     at the deadline, so DTEND is the real due time.
@@ -190,7 +202,9 @@ def assignments(events: list[dict], courses: dict[str, str] | None = None) -> li
             "uid": event["uid"],
             "title": f"[{courses.get(code, code)}] {name}" if code else name,
             "due": due,
-            "notes": f"Course {course}" if course else event.get("description", ""),
+            "alert": due - timedelta(hours=remind_hours_before),
+            "notes": f"Deadline: {due.astimezone():%a %d %b %H:%M}\n"
+                     + (f"Course {course}" if course else event.get("description", "")),
         })
     result.sort(key=lambda a: a["due"])
     return result
@@ -200,7 +214,7 @@ def plan(feed: list[dict], state: dict, now: datetime) -> tuple[list[dict], list
     """Split feed assignments into (to_add, to_update).
 
     New assignments are added only if still upcoming. Known ones are updated
-    when their deadline, title or notes differ from what was last synced,
+    when their deadline, alert, title or notes differ from what was last synced,
     whether or not they are still upcoming.
     """
     to_add, to_update = [], []
@@ -209,8 +223,8 @@ def plan(feed: list[dict], state: dict, now: datetime) -> tuple[list[dict], list
         if known is None:
             if a["due"] >= now:
                 to_add.append(a)
-        elif (known["due"], known["title"], known.get("notes")) != (
-            a["due"].isoformat(), a["title"], a["notes"]
+        elif (known["due"], known.get("alert"), known["title"], known.get("notes")) != (
+            a["due"].isoformat(), a["alert"].isoformat(), a["title"], a["notes"]
         ):
             to_update.append(a)
     return to_add, to_update
@@ -242,18 +256,20 @@ def run_reminder_script(*args: str) -> str:
     return result.stdout.strip()
 
 
-def due_parts(due: datetime) -> list[str]:
-    local = due.astimezone()  # Reminders wants the Mac's local time
+def date_parts(when: datetime) -> list[str]:
+    local = when.astimezone()  # Reminders wants the Mac's local time
     return [str(local.year), str(local.month), str(local.day), str(local.hour), str(local.minute)]
 
 
 def add_reminder(list_name: str, a: dict) -> str:
-    return run_reminder_script("add", list_name, a["title"], a["notes"], *due_parts(a["due"]))
+    return run_reminder_script(
+        "add", list_name, a["title"], a["notes"], *date_parts(a["alert"])
+    )
 
 
 def update_reminder(list_name: str, reminder_id: str, a: dict) -> str:
     return run_reminder_script(
-        "update", list_name, reminder_id, a["title"], a["notes"], *due_parts(a["due"])
+        "update", list_name, reminder_id, a["title"], a["notes"], *date_parts(a["alert"])
     )
 
 
@@ -262,6 +278,7 @@ def remember(state: dict, a: dict, reminder_id: str) -> None:
         "reminder_id": reminder_id,
         "title": a["title"],
         "due": a["due"].isoformat(),
+        "alert": a["alert"].isoformat(),
         "notes": a["notes"],
     }
     save_state(state)  # save after each change so a later failure never duplicates
@@ -283,7 +300,11 @@ def main(argv: list[str]) -> int:
         return 1
     list_name = config.get("list_name", "TODO")
 
-    feed = assignments(parse_events(fetch_feed(config["ical_url"])), config.get("courses"))
+    feed = assignments(
+        parse_events(fetch_feed(config["ical_url"])),
+        config.get("courses"),
+        config.get("remind_hours_before", DEFAULT_REMIND_HOURS_BEFORE),
+    )
     state = load_json(STATE_PATH, {"assignments": {}})["assignments"]
     to_add, to_update = plan(feed, state, datetime.now(timezone.utc))
 

@@ -5,8 +5,11 @@ in step when a deadline moves.
 
 An hourly background job (launchd) downloads the myCourseVille iCal feed and adds
 each future "Assignment due" event to a Reminders list (default `TODO`) as
-`[Course] Assignment`, due at the real deadline, with the course code in the
-notes. Reminders syncs
+`[Course] Assignment`, with the real deadline and course code in the notes.
+
+Reminders keeps one time per reminder (its due date and alert are always the
+same), so each reminder is dated `remind_hours_before` (default 3) hours before
+the deadline, and that is when it alerts. Reminders syncs
 them to iPhone through iCloud.
 
 - Only future assignments are added; meetings and classes are ignored.
@@ -24,7 +27,7 @@ macOS blocks launchd jobs from reading `~/Documents`, so the job runs from
 | File | What |
 |---|---|
 | `sync.py` | copy of the script, refreshed by `./install.sh` |
-| `config.json` | your private iCal URL (never committed), list name, and `courses`: course code to the name shown in `[...]` |
+| `config.json` | your private iCal URL (never committed), list name, `remind_hours_before`, and `courses`: course code to the name shown in `[...]` |
 | `state.json` | which assignments were added, and as which reminder |
 | `logs/sync.log` | output of every run |
 
