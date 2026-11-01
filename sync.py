@@ -3,18 +3,23 @@
 
 Downloads the myCourseVille iCal feed, picks the "Assignment due" events
 that are still in the future, and adds each one as a reminder due at the
-real deadline. Every added event UID is remembered in state.json, so a
-reminder you complete or delete is never re-created.
+real deadline. Each added event is remembered in state.json together with
+its reminder, which means:
+
+- a reminder you complete or delete is never re-created;
+- if the teacher moves the deadline or renames the assignment, the reminder
+  is updated to match (unless you already completed or deleted it).
 
 Usage:
-    /usr/bin/python3 sync.py            # add new assignments to Reminders
-    /usr/bin/python3 sync.py --dry-run  # only print what would be added
+    /usr/bin/python3 sync.py            # add / update reminders
+    /usr/bin/python3 sync.py --dry-run  # only print what would change
 """
 
 from __future__ import annotations
 
 import html
 import json
+import re
 import subprocess
 import sys
 import urllib.request
@@ -22,31 +27,55 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
-STATE_PATH = ROOT / "state.json"
+# Outside ~/Documents on purpose: macOS blocks background (launchd) jobs from
+# reading Documents, so install.sh copies this script here and runs it from here.
+DATA_DIR = Path.home() / "Library" / "Application Support" / "courseville-todo"
+CONFIG_PATH = DATA_DIR / "config.json"
+STATE_PATH = DATA_DIR / "state.json"
 
 ASSIGNMENT_PREFIX = "Assignment due:"
+# The description ends with e.g. "This is an assignment from 2190443.i (2026/1)."
+COURSE_PATTERN = re.compile(r"assignment from (.+?)\.?\s*$", re.IGNORECASE)
 DEFAULT_TIMEZONE = "Asia/Bangkok"
 
 # Arguments are passed through argv rather than spliced into the script, so
 # quotes or backslashes in an assignment title cannot break the AppleScript.
-ADD_REMINDER_SCRIPT = """
-on run argv
-    set listName to item 1 of argv
-    set theName to item 2 of argv
-    set theBody to item 3 of argv
+#   add    <list> <title> <notes> <y> <m> <d> <h> <min>  -> prints reminder id
+#   update <list> <id> <title> <notes> <y> <m> <d> <h> <min> -> prints updated|completed|missing
+REMINDER_SCRIPT = """
+on makeDate(argv, i)
     set d to current date
     set day of d to 1
-    set year of d to (item 4 of argv) as integer
-    set month of d to (item 5 of argv) as integer
-    set day of d to (item 6 of argv) as integer
-    set hours of d to (item 7 of argv) as integer
-    set minutes of d to (item 8 of argv) as integer
+    set year of d to (item i of argv) as integer
+    set month of d to (item (i + 1) of argv) as integer
+    set day of d to (item (i + 2) of argv) as integer
+    set hours of d to (item (i + 3) of argv) as integer
+    set minutes of d to (item (i + 4) of argv) as integer
     set seconds of d to 0
+    return d
+end makeDate
+
+on run argv
+    set mode to item 1 of argv
+    set listName to item 2 of argv
     tell application "Reminders"
         if not (exists list listName) then make new list with properties {name:listName}
-        tell list listName to make new reminder with properties {name:theName, body:theBody, due date:d}
+        if mode is "add" then
+            set d to my makeDate(argv, 5)
+            tell list listName to set r to make new reminder with properties {name:(item 3 of argv), body:(item 4 of argv), due date:d}
+            return id of r
+        end if
+        set d to my makeDate(argv, 6)
+        try
+            set r to first reminder of list listName whose id is (item 3 of argv)
+        on error
+            return "missing"
+        end try
+        if completed of r then return "completed"
+        set name of r to (item 4 of argv)
+        set body of r to (item 5 of argv)
+        set due date of r to d
+        return "updated"
     end tell
 end run
 """
@@ -132,8 +161,14 @@ def parse_events(text: str) -> list[dict]:
     return events
 
 
-def upcoming_assignments(events: list[dict], now: datetime) -> list[dict]:
-    """Future "Assignment due" events, soonest first, with a clean title.
+def notes_for(description: str) -> str:
+    """Reduce the calendar description to the course it belongs to."""
+    match = COURSE_PATTERN.search(description)
+    return f"Course {match.group(1)}" if match else description
+
+
+def assignments(events: list[dict]) -> list[dict]:
+    """All "Assignment due" events, soonest first, with a clean title.
 
     myCourseVille starts each event one hour before the deadline and ends it
     at the deadline, so DTEND is the real due time.
@@ -141,19 +176,37 @@ def upcoming_assignments(events: list[dict], now: datetime) -> list[dict]:
     result = []
     for event in events:
         summary = event.get("summary", "")
-        if not summary.startswith(ASSIGNMENT_PREFIX) or "uid" not in event:
-            continue
         due = event.get("dtend") or event.get("dtstart")
-        if due is None or due < now:
+        if not summary.startswith(ASSIGNMENT_PREFIX) or "uid" not in event or due is None:
             continue
         result.append({
             "uid": event["uid"],
             "title": summary[len(ASSIGNMENT_PREFIX):].strip(),
             "due": due,
-            "notes": event.get("description", ""),
+            "notes": notes_for(event.get("description", "")),
         })
     result.sort(key=lambda a: a["due"])
     return result
+
+
+def plan(feed: list[dict], state: dict, now: datetime) -> tuple[list[dict], list[dict]]:
+    """Split feed assignments into (to_add, to_update).
+
+    New assignments are added only if still upcoming. Known ones are updated
+    when their deadline, title or notes differ from what was last synced,
+    whether or not they are still upcoming.
+    """
+    to_add, to_update = [], []
+    for a in feed:
+        known = state.get(a["uid"])
+        if known is None:
+            if a["due"] >= now:
+                to_add.append(a)
+        elif (known["due"], known["title"], known.get("notes")) != (
+            a["due"].isoformat(), a["title"], a["notes"]
+        ):
+            to_update.append(a)
+    return to_add, to_update
 
 
 # --- Side effects -----------------------------------------------------------
@@ -164,8 +217,8 @@ def load_json(path: Path, default):
     return json.loads(path.read_text())
 
 
-def save_state(added: set[str]) -> None:
-    STATE_PATH.write_text(json.dumps({"added": sorted(added)}, indent=2) + "\n")
+def save_state(state: dict) -> None:
+    STATE_PATH.write_text(json.dumps({"assignments": state}, indent=2, sort_keys=True) + "\n")
 
 
 def fetch_feed(url: str) -> str:
@@ -174,13 +227,41 @@ def fetch_feed(url: str) -> str:
         return response.read().decode("utf-8")
 
 
-def add_reminder(list_name: str, assignment: dict) -> None:
-    due = assignment["due"].astimezone()  # Reminders wants the Mac's local time
-    subprocess.run(
-        ["osascript", "-", list_name, assignment["title"], assignment["notes"],
-         str(due.year), str(due.month), str(due.day), str(due.hour), str(due.minute)],
-        input=ADD_REMINDER_SCRIPT, text=True, check=True, capture_output=True,
+def run_reminder_script(*args: str) -> str:
+    result = subprocess.run(
+        ["osascript", "-", *args],
+        input=REMINDER_SCRIPT, text=True, check=True, capture_output=True,
     )
+    return result.stdout.strip()
+
+
+def due_parts(due: datetime) -> list[str]:
+    local = due.astimezone()  # Reminders wants the Mac's local time
+    return [str(local.year), str(local.month), str(local.day), str(local.hour), str(local.minute)]
+
+
+def add_reminder(list_name: str, a: dict) -> str:
+    return run_reminder_script("add", list_name, a["title"], a["notes"], *due_parts(a["due"]))
+
+
+def update_reminder(list_name: str, reminder_id: str, a: dict) -> str:
+    return run_reminder_script(
+        "update", list_name, reminder_id, a["title"], a["notes"], *due_parts(a["due"])
+    )
+
+
+def remember(state: dict, a: dict, reminder_id: str) -> None:
+    state[a["uid"]] = {
+        "reminder_id": reminder_id,
+        "title": a["title"],
+        "due": a["due"].isoformat(),
+        "notes": a["notes"],
+    }
+    save_state(state)  # save after each change so a later failure never duplicates
+
+
+def label(a: dict) -> str:
+    return f"{a['title']} (due {a['due'].astimezone():%a %d %b %H:%M})"
 
 
 def log(message: str) -> None:
@@ -191,30 +272,38 @@ def main(argv: list[str]) -> int:
     dry_run = "--dry-run" in argv
     config = load_json(CONFIG_PATH, None)
     if not config or not config.get("ical_url"):
-        log(f"Missing {CONFIG_PATH.name}; copy config.example.json and add your iCal URL.")
+        log(f"Missing {CONFIG_PATH}; copy config.example.json there and add your iCal URL.")
         return 1
     list_name = config.get("list_name", "CourseVille")
 
-    events = parse_events(fetch_feed(config["ical_url"]))
-    now = datetime.now(timezone.utc)
-    added = set(load_json(STATE_PATH, {"added": []})["added"])
-    new = [a for a in upcoming_assignments(events, now) if a["uid"] not in added]
+    feed = assignments(parse_events(fetch_feed(config["ical_url"])))
+    state = load_json(STATE_PATH, {"assignments": {}})["assignments"]
+    to_add, to_update = plan(feed, state, datetime.now(timezone.utc))
 
-    for assignment in new:
-        label = f"{assignment['title']} (due {assignment['due'].astimezone():%a %d %b %H:%M})"
-        if dry_run:
-            log(f"Would add: {label}")
-            continue
-        try:
-            add_reminder(list_name, assignment)
-        except subprocess.CalledProcessError as error:
-            log(f"Failed to add {label}: {error.stderr.strip()}")
-            return 1
-        added.add(assignment["uid"])
-        save_state(added)  # save after each one so a later failure never duplicates
-        log(f"Added: {label}")
+    try:
+        for a in to_add:
+            if dry_run:
+                log(f"Would add: {label(a)}")
+                continue
+            remember(state, a, add_reminder(list_name, a))
+            log(f"Added: {label(a)}")
 
-    log(f"Done. {len(events)} events in feed, {len(new)} new assignment(s).")
+        for a in to_update:
+            if dry_run:
+                log(f"Would update: {label(a)}")
+                continue
+            reminder_id = state[a["uid"]]["reminder_id"]
+            outcome = update_reminder(list_name, reminder_id, a)
+            # Remember the new version either way, so a completed or deleted
+            # reminder is not retried every hour.
+            remember(state, a, reminder_id)
+            log(f"{outcome.capitalize()}: {label(a)}" if outcome == "updated"
+                else f"Skipped ({outcome} in Reminders): {label(a)}")
+    except subprocess.CalledProcessError as error:
+        log(f"Reminders error: {error.stderr.strip()}")
+        return 1
+
+    log(f"Done. {len(feed)} assignments in feed, {len(to_add)} new, {len(to_update)} changed.")
     return 0
 
 
